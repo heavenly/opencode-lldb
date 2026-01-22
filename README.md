@@ -1,33 +1,92 @@
-# LLDB Debug Mode for OpenCode
+# @elitist/opencode-lldb-debug
 
-An OpenCode plugin + agent that enables LLDB-powered debugging with automatic build, artifact detection, and structured output.
+An OpenCode plugin that enables LLDB-powered debugging with automatic build, artifact detection, and structured crash analysis.
 
-## Overview
+## Installation
 
-This project provides a complete debugging workflow for OpenCode:
+### Via npm (Recommended)
 
-1. **Plugin** (`.opencode/plugins/lldb_debug_mode.ts`) - Provides the `debug_run` tool
-2. **Agent** (`.opencode/agent/debug.md`) - Auto-detects debug requests and orchestrates the workflow
+```bash
+npm install @elitist/opencode-lldb-debug
+```
 
-## Files
+### Configure OpenCode
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `lldb_debug_mode.ts` | `.opencode/plugins/` | Plugin providing the `debug_run` tool |
-| `debug.md` | `.opencode/agent/` | Agent that detects debug requests and calls the tool |
+Add the plugin to your OpenCode configuration file (`~/.config/opencode/config.json`):
 
-## Plugin: lldb_debug_mode.ts
+```json
+{
+  "plugins": [
+    "@elitist/opencode-lldb-debug"
+  ]
+}
+```
 
-**Location:** `.opencode/plugins/lldb_debug_mode.ts`
+Restart OpenCode after installation.
 
-The plugin registers the `debug_run` tool which:
+### Manual Installation
 
-- Executes LLM-chosen build commands
-- Auto-selects the newest executable from common directories
-- Runs LLDB in batch mode with configurable breakpoints
-- Returns structured output with crash detection
+```bash
+# Clone or download the repository
+git clone https://github.com/elitist/opencode-lldb-debug.git
 
-### Tool Parameters
+# Copy plugin files to OpenCode plugins directory
+cp -r opencode-lldb-debug/src ~/.config/opencode/plugins/lldb_debug/
+cp opencode-lldb-debug/index.ts ~/.config/opencode/plugins/lldb_debug/index.ts
+```
+
+## Features
+
+- **Auto-detection** - Automatically activates when you mention debug keywords (debug, crash, breakpoint, segfault, etc.)
+- **Smart build** - Infers and runs build commands based on project type (Rust, C++, Node.js, etc.)
+- **Executable finder** - Automatically selects the newest executable from common build directories
+- **LLDB integration** - Runs LLDB in batch mode with breakpoints and variable inspection
+- **Structured output** - Returns parsed results with crash location, thread info, and exit reasons
+- **Progressive debugging** - Suggests reruns with additional breakpoints when needed
+
+No separate agent file needed - debug mode is embedded in the plugin!
+
+## Usage
+
+Just ask OpenCode to debug naturally:
+
+```
+"debug this program"
+"why is my program crashing?"
+"set a breakpoint at the login function"
+"debug the segfault in main.cpp line 42"
+```
+
+The plugin automatically:
+1. Detects the debug request
+2. Infers build commands from your project structure
+3. Builds the project
+4. Finds the executable
+5. Runs LLDB with appropriate breakpoints
+6. Returns structured analysis
+
+### Multi-Artifact Projects
+
+If multiple executables are found:
+
+```
+No executable found. Which would you like to debug?
+
+1. ./target/debug/myapp (Executable, mode: 100755)
+2. ./target/release/myapp (Executable, mode: 100755)
+
+Or provide a custom path.
+```
+
+### Rerun with More Instrumentation
+
+If the initial run is inconclusive, the plugin suggests:
+
+- Add function breakpoints (`breakpointsByName`)
+- Add file:line breakpoints (`fileLineBreakpoints`)
+- Add variable prints (`expressionPrints`)
+
+## Tool Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -42,7 +101,7 @@ The plugin registers the `debug_run` tool which:
 | `attempt` | `number` | `1` | Rerun counter for progressive debugging |
 | `targetOverride` | `string` | - | Manual executable path (bypass auto-detection) |
 
-### Tool Output
+## Tool Output
 
 ```typescript
 {
@@ -61,107 +120,9 @@ The plugin registers the `debug_run` tool which:
 }
 ```
 
-## Agent: debug.md
+## How It Works
 
-**Location:** `.opencode/agent/debug.md`
-
-The agent automatically triggers when the user asks to debug something. It:
-
-1. Detects debug keywords in user prompts ("debug", "crash", "breakpoint", etc.)
-2. Calls `debug_run` with inferred build commands and breakpoints
-3. Analyzes results and determines if more instrumentation is needed
-4. Proposes rerun options with additional breakpoints/prints
-5. Asks user approval before any code edits for fallback instrumentation
-
-### Supported Debug Keywords
-
-- debug, debugging, debugger
-- breakpoint, breakpoints
-- lldb
-- crash, segmentation fault, assertion failed
-
-### Workflow
-
-1. **Initial Debug Run**
-   - Infer build commands (npm run build, cargo build, make, etc.)
-   - Infer relevant breakpoints from the issue description
-   - Call `debug_run` with attempt=1
-
-2. **Handle Results**
-   - If `status === "needs-target"`: Present artifact candidates, ask user to select
-   - If `status === "build-failed"`: Analyze build errors, propose fixes
-   - If `status === "lldb-failed"`: Analyze LLDB errors, suggest parameter adjustments
-   - If `status === "ok"`: Analyze crash points, stack traces, assertion failures
-
-3. **Rerun Policy**
-   If the run is inconclusive:
-   - Option A: Add function breakpoints (`breakpointsByName`)
-   - Option B: Add file:line breakpoints (`fileLineBreakpoints`)
-   - Option C: Add variable prints (`expressionPrints`)
-   - Option D: Run without breakpoints
-
-   Present options and get user approval before rerunning.
-
-4. **Instrumentation Fallback** (User-Approved Only)
-   - Describe exactly what code changes will be made
-   - Get explicit user approval with "Yes, make these changes"
-   - Run debug again with instrumentation
-   - Clean up instrumentation when done
-
-## Installation
-
-### Step 1: Install Plugin
-
-```bash
-# Create the plugins directory if it doesn't exist
-mkdir -p .opencode/plugins
-
-# Copy the plugin file
-cp lldb_debug_mode.ts .opencode/plugins/
-```
-
-### Step 2: Install Agent (Optional - for auto-detection)
-
-```bash
-# Create the agent directory if it doesn't exist
-mkdir -p .opencode/agent
-
-# Copy the agent template
-cp debug.md .opencode/agent/
-```
-
-### Step 3: Restart OpenCode
-
-OpenCode automatically loads plugins and agents from `.opencode/` on startup.
-
-## Usage
-
-### Basic
-
-User: "debug this program"
-
-Agent detects the request → calls `debug_run` → returns structured results
-
-### With Specifics
-
-User: "debug the crash in the login function"
-
-Agent infers breakpoints for "login" → runs debug → shows crash location and stack trace
-
-### Multi-Artifact Projects
-
-If multiple executables are found, the agent presents candidates:
-
-```
-No executable found. Which would you like to debug?
-
-1. ./target/debug/myapp (Executable)
-2. ./target/release/myapp (Executable)
-
-Or provide a custom path.
-```
-
-## Artifact Selection
+### 1. Artifact Selection
 
 The plugin automatically finds executables by:
 
@@ -172,9 +133,9 @@ The plugin automatically finds executables by:
 3. Sorting by modification time (newest first)
 4. Returning top 5 candidates for user selection if ambiguous
 
-## LLDB Script Generation
+### 2. LLDB Script Generation
 
-The plugin generates LLDB scripts with:
+The plugin generates LLDB scripts like:
 
 ```lldb
 settings set auto-confirm true
@@ -204,15 +165,62 @@ thread backtrace all
 quit
 ```
 
-## Error Logging
+### 3. Crash Analysis
 
-Errors are logged to `error.log` in the project directory with timestamps:
+Automatically detects and parses:
+- Crash signals (EXC_BAD_ACCESS, SIGSEGV, SIGABRT, etc.)
+- Crash location (function + file:line)
+- Crashed thread number
+- Exit reason
+
+## Examples
+
+### Example 1: Debug a Rust Program
 
 ```
-[2026-01-21T10:30:00.000Z] debug_run.execute called: {"buildCommands":["npm run build"]}
-[2026-01-21T10:30:01.500Z] Running build command: npm run build
-[2026-01-21T10:30:05.200Z] Running LLDB on: ./target/debug/myapp
+User: "debug this rust program, it's crashing"
+
+OpenCode:
+1. Detects "debug" + "crashing"
+2. Infers buildCommands: ["cargo build"]
+3. Calls debug_run
+4. Finds ./target/debug/myapp
+5. Runs LLDB
+6. Returns crash analysis with stack trace
 ```
+
+### Example 2: Debug with Specific Breakpoint
+
+```
+User: "debug the crash at handle_request function"
+
+OpenCode:
+1. Infers buildCommands from project
+2. Sets breakpointsByName: ["handle_request"]
+3. Runs LLDB
+4. Shows variables at breakpoint
+5. Continues to crash
+6. Shows crash location
+```
+
+### Example 3: Rerun with More Details
+
+```
+User: "debug but I need to see the value of userID"
+
+OpenCode:
+1. Runs debug_run with expressionPrints: ["userID"]
+2. Shows userID value at each breakpoint
+3. Helps identify the issue
+```
+
+## Safety
+
+- All runs enforce `maxSeconds` timeout (default: 20s)
+- Partial logs returned on timeout
+- Build stops on first failure (early exit)
+- Crash detection via signal pattern matching
+- Temp files use OS temp directory (auto-cleanup)
 
 ## Testing
 
@@ -225,55 +233,11 @@ Errors are logged to `error.log` in the project directory with timestamps:
 5. **Expression prints**: Test `expressionPrints: ["myVariable", "pointer->field"]`
 6. **Crash location**: Verify `crashLocation` is populated on crashes
 
-### Safety
-
-- All runs enforce `maxSeconds` timeout (default: 20s)
-- Partial logs returned on timeout
-- Build stops on first failure (early exit)
-- Crash detection via signal pattern matching
-- Temp files use OS temp directory (auto-cleanup)
-
 ## Requirements
 
 - **LLDB** - Must be installed on the system (`lldb --version`)
 - **OpenCode** - Latest version with plugin support
-- **Node.js/Bun** - For running the TypeScript plugin
-
-## File Structure
-
-```
-opencode-lldb/
-├── README.md                    # This file
-├── FIXES.md                     # Detailed changelog of corrections
-├── plan.md                      # Original implementation plan
-├── debug.md                     # Agent template (copy to .opencode/agent/)
-├── lldb_debug_mode.ts           # Source plugin file
-├── .opencode/
-│   ├── plugins/
-│   │   └── lldb_debug_mode.ts   # Copy for OpenCode to load
-│   ├── agent/                   # (Create this directory)
-│   │   └── debug.md             # Agent for auto-detection
-│   ├── package.json             # Dependencies (@opencode-ai/plugin)
-│   └── error.log                # Generated on errors
-```
-
-## Creating debug.md Agent
-
-Create `.opencode/agent/debug.md` with this template:
-
-See `debug.md` in the repository root for the complete agent template.
-
-Quick start:
-```bash
-cp debug.md .opencode/agent/
-```
-
-The agent template includes:
-- Automatic keyword detection (debug, crash, breakpoint, etc.)
-- Build command inference based on project type
-- Structured rerun proposals with concrete parameter suggestions
-- User approval workflow for instrumentation fallback
-```
+- **Node.js** - Version 18 or higher
 
 ## License
 
