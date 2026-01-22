@@ -35,6 +35,8 @@ The plugin registers the `debug_run` tool which:
 | `programArgs` | `string[]` | `[]` | Arguments passed to the executable |
 | `artifactRoots` | `string[]` | `["target/debug", "target/release", ".build", "build", "dist", "out", "bin"]` | Directories to search for executables |
 | `breakpointsByName` | `string[]` | `[]` | Function/symbol names to set breakpoints on |
+| `fileLineBreakpoints` | `Array<{file: string, line: number}>` | `[]` | File:line breakpoints for specific locations |
+| `expressionPrints` | `string[]` | `[]` | Variable expressions to print at breakpoints |
 | `breakpointLogCommands` | `string[]` | `["thread backtrace all", "frame variable"]` | Commands run when breakpoint hits |
 | `maxSeconds` | `number` | `20` | Timeout in seconds (safety limit) |
 | `attempt` | `number` | `1` | Rerun counter for progressive debugging |
@@ -93,9 +95,9 @@ The agent automatically triggers when the user asks to debug something. It:
 
 3. **Rerun Policy**
    If the run is inconclusive:
-   - Option A: Add function breakpoints
-   - Option B: Add file:line breakpoints
-   - Option C: Add variable prints at breakpoints
+   - Option A: Add function breakpoints (`breakpointsByName`)
+   - Option B: Add file:line breakpoints (`fileLineBreakpoints`)
+   - Option C: Add variable prints (`expressionPrints`)
    - Option D: Run without breakpoints
 
    Present options and get user approval before rerunning.
@@ -115,7 +117,7 @@ The agent automatically triggers when the user asks to debug something. It:
 mkdir -p .opencode/plugins
 
 # Copy the plugin file
-cp plugins/lldb_debug_mode.ts .opencode/plugins/
+cp lldb_debug_mode.ts .opencode/plugins/
 ```
 
 ### Step 2: Install Agent (Optional - for auto-detection)
@@ -124,8 +126,8 @@ cp plugins/lldb_debug_mode.ts .opencode/plugins/
 # Create the agent directory if it doesn't exist
 mkdir -p .opencode/agent
 
-# Create the debug agent from the template below
-# (See debug.md section below)
+# Copy the agent template
+cp debug.md .opencode/agent/
 ```
 
 ### Step 3: Restart OpenCode
@@ -165,7 +167,7 @@ The plugin automatically finds executables by:
 
 1. Scanning configured directories (depth ≤ 3)
 2. Filtering by platform:
-   - **macOS/Linux**: Files with executable mode (`mode & 0o111 != 0`)
+   - **macOS/Linux**: Files with executable mode (`mode & 0o111 != 0`), excluding `.a`, `.o`, `.so`, `.dylib`
    - **Windows**: `.exe`, `.cmd`, `.bat` files
 3. Sorting by modification time (newest first)
 4. Returning top 5 candidates for user selection if ambiguous
@@ -177,13 +179,25 @@ The plugin generates LLDB scripts with:
 ```lldb
 settings set auto-confirm true
 settings set target.stop-on-sharedlibrary-events false
+
+# Function breakpoints
 breakpoint set --name "function_name"
 breakpoint command add 1
   thread backtrace all
   frame variable
-  [breakpointLogCommands]
+  expr -- variable_name
   process continue
   DONE
+
+# File:line breakpoints
+breakpoint set --file "main.cpp" --line 42
+breakpoint command add 2
+  thread backtrace all
+  frame variable
+  expr -- some_variable
+  process continue
+  DONE
+
 run
 process status
 thread backtrace all
@@ -207,13 +221,17 @@ Errors are logged to `error.log` in the project directory with timestamps:
 1. **Single executable project**: Verify build → artifact selection → LLDB run → transcript
 2. **Multi-artifact repo**: Verify candidates returned and user selection prompted
 3. **Rerun**: Verify attempt 2 adds breakpoints and produces more detailed output
+4. **File:line breakpoints**: Test `fileLineBreakpoints: [{file: "main.cpp", line: 42}]`
+5. **Expression prints**: Test `expressionPrints: ["myVariable", "pointer->field"]`
+6. **Crash location**: Verify `crashLocation` is populated on crashes
 
 ### Safety
 
 - All runs enforce `maxSeconds` timeout (default: 20s)
 - Partial logs returned on timeout
-- Build failures detected before LLDB execution
+- Build stops on first failure (early exit)
 - Crash detection via signal pattern matching
+- Temp files use OS temp directory (auto-cleanup)
 
 ## Requirements
 
@@ -226,9 +244,10 @@ Errors are logged to `error.log` in the project directory with timestamps:
 ```
 opencode-lldb/
 ├── README.md                    # This file
+├── FIXES.md                     # Detailed changelog of corrections
 ├── plan.md                      # Original implementation plan
-├── plugins/
-│   └── lldb_debug_mode.ts       # Source plugin file
+├── debug.md                     # Agent template (copy to .opencode/agent/)
+├── lldb_debug_mode.ts           # Source plugin file
 ├── .opencode/
 │   ├── plugins/
 │   │   └── lldb_debug_mode.ts   # Copy for OpenCode to load
@@ -242,31 +261,18 @@ opencode-lldb/
 
 Create `.opencode/agent/debug.md` with this template:
 
-```markdown
-# Debug Mode Agent
+See `debug.md` in the repository root for the complete agent template.
 
-You are a debugging specialist. When the user asks to debug something:
+Quick start:
+```bash
+cp debug.md .opencode/agent/
+```
 
-1. **Immediately call `debug_run`** with:
-   - `buildCommands`: Infer from project type (npm run build, cargo build, make, etc.)
-   - `breakpointsByName`: Functions relevant to the issue
-   - `attempt`: 1
-
-2. **Handle results**:
-   - If `status === "needs-target"`: Show candidates, ask user to pick
-   - If `status === "build-failed"`: Analyze errors, propose fixes
-   - If `status === "lldb-failed"`: Suggest parameter adjustments
-   - If `status === "ok"`: Analyze crash points, stack traces
-
-3. **Propose reruns** if inconclusive:
-   - Add more breakpoints
-   - Add file:line breakpoints
-   - Add variable prints
-
-4. **Ask approval** before any code edits for instrumentation.
-
-Available tools:
-- `debug_run`: Build and debug with LLDB
+The agent template includes:
+- Automatic keyword detection (debug, crash, breakpoint, etc.)
+- Build command inference based on project type
+- Structured rerun proposals with concrete parameter suggestions
+- User approval workflow for instrumentation fallback
 ```
 
 ## License

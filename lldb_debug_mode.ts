@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 import { spawn } from "child_process";
 
 interface BuildResult {
@@ -27,6 +28,11 @@ interface LLDBResult {
   stderr: string;
 }
 
+interface FileLineBreakpoint {
+  file: string;
+  line: number;
+}
+
 const ERROR_LOG_PATH = path.join(process.cwd(), "error.log");
 
 function logError(msg: string, err?: unknown): void {
@@ -50,28 +56,36 @@ function execCommand(cmd: string, timeoutMs = 60000): Promise<{ exitCode: number
       }
     }, timeoutMs);
 
-    const child = spawn(cmd, { shell: true, timeout: timeoutMs });
-    let stdout = "";
-    let stderr = "";
+    try {
+      const child = spawn(cmd, { shell: true, timeout: timeoutMs });
+      let stdout = "";
+      let stderr = "";
 
-    child.stdout.on("data", (data) => { stdout += data.toString(); });
-    child.stderr.on("data", (data) => { stderr += data.toString(); });
+      child.stdout.on("data", (data) => { stdout += data.toString(); });
+      child.stderr.on("data", (data) => { stderr += data.toString(); });
 
-    child.on("close", (code) => {
+      child.on("close", (code) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve({ exitCode: code || 0, stdout, stderr });
+        }
+      });
+
+      child.on("error", (err) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve({ exitCode: -1, stdout: "", stderr: err.message });
+        }
+      });
+    } catch (err) {
       if (!resolved) {
         resolved = true;
         clearTimeout(timeout);
-        resolve({ exitCode: code || 0, stdout, stderr });
+        resolve({ exitCode: -1, stdout: "", stderr: err instanceof Error ? err.message : String(err) });
       }
-    });
-
-    child.on("error", (err) => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        resolve({ exitCode: -1, stdout: "", stderr: err.message });
-      }
-    });
+    }
   });
 }
 
@@ -82,19 +96,26 @@ async function runBuildCommands(commands: string[]): Promise<BuildResult> {
 
   let combinedStdout = "";
   let combinedStderr = "";
-  let overallExitCode = 0;
 
   for (const cmd of commands) {
     logError(`Running build command: ${cmd}`);
-    const result = await execCommand(cmd);
-    combinedStdout += `> ${cmd}\n${result.stdout}\n`;
-    combinedStderr += `> ${cmd}\n${result.stderr}\n`;
-    if (result.exitCode !== 0) {
-      overallExitCode = result.exitCode;
+    try {
+      const result = await execCommand(cmd);
+      combinedStdout += `> ${cmd}\n${result.stdout}\n`;
+      combinedStderr += `> ${cmd}\n${result.stderr}\n`;
+      
+      // Stop on first failure
+      if (result.exitCode !== 0) {
+        return { exitCode: result.exitCode, stdout: combinedStdout, stderr: combinedStderr };
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      combinedStderr += `> ${cmd}\nError: ${errMsg}\n`;
+      return { exitCode: -1, stdout: combinedStdout, stderr: combinedStderr };
     }
   }
 
-  return { exitCode: overallExitCode, stdout: combinedStdout, stderr: combinedStderr };
+  return { exitCode: 0, stdout: combinedStdout, stderr: combinedStderr };
 }
 
 async function findNewestExecutable(artifactRoots: string[]): Promise<ArtifactResult> {
@@ -105,7 +126,7 @@ async function findNewestExecutable(artifactRoots: string[]): Promise<ArtifactRe
     if (depth > maxDepth) return;
 
     try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
       for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
@@ -114,7 +135,7 @@ async function findNewestExecutable(artifactRoots: string[]): Promise<ArtifactRe
           await scanDirectory(fullPath, depth + 1);
         } else if (entry.isFile()) {
           try {
-            const stats = fs.statSync(fullPath);
+            const stats = await fs.promises.stat(fullPath);
             let isExecutable = false;
             let reason = "";
 
@@ -128,7 +149,7 @@ async function findNewestExecutable(artifactRoots: string[]): Promise<ArtifactRe
               }
             } else {
               const mode = stats.mode & 0o111;
-              if (mode !== 0 && !entry.name.endsWith(".a") && !entry.name.endsWith(".o") && !entry.name.endsWith(".so")) {
+              if (mode !== 0 && !entry.name.endsWith(".a") && !entry.name.endsWith(".o") && !entry.name.endsWith(".so") && !entry.name.endsWith(".dylib")) {
                 isExecutable = true;
                 reason = `Executable (mode: ${stats.mode.toString(8)})`;
               }
@@ -163,28 +184,55 @@ async function findNewestExecutable(artifactRoots: string[]): Promise<ArtifactRe
 
 async function generateLLDBScript(
   breakpointsByName: string[],
+  fileLineBreakpoints: FileLineBreakpoint[],
+  expressionPrints: string[],
   breakpointLogCommands: string[],
   programArgs: string[]
 ): Promise<string> {
   let script = `settings set auto-confirm true\n`;
-  script += `settings set target.stop-on-sharedlibrary-events false\n`;
+  script += `settings set target.stop-on-sharedlibrary-events false\n\n`;
 
   let breakpointId = 1;
 
+  // Add function/symbol breakpoints
   for (const symbol of breakpointsByName) {
     script += `breakpoint set --name "${symbol}"\n`;
     script += `breakpoint command add ${breakpointId}\n`;
-    script += `thread backtrace all\n`;
-    script += `frame variable\n`;
-
+    
+    // Add custom log commands (no duplication - these ARE the commands)
     for (const cmd of breakpointLogCommands) {
       script += `${cmd}\n`;
     }
+    
+    // Add expression prints
+    for (const expr of expressionPrints) {
+      script += `expr -- ${expr}\n`;
+    }
+    
     script += `process continue\n`;
-    script += `DONE\n`;
+    script += `DONE\n\n`;
     breakpointId++;
   }
 
+  // Add file:line breakpoints
+  for (const bp of fileLineBreakpoints) {
+    script += `breakpoint set --file "${bp.file}" --line ${bp.line}\n`;
+    script += `breakpoint command add ${breakpointId}\n`;
+    
+    for (const cmd of breakpointLogCommands) {
+      script += `${cmd}\n`;
+    }
+    
+    for (const expr of expressionPrints) {
+      script += `expr -- ${expr}\n`;
+    }
+    
+    script += `process continue\n`;
+    script += `DONE\n\n`;
+    breakpointId++;
+  }
+
+  // Set program arguments
   if (programArgs.length > 0) {
     script += `settings set target.run-args ${programArgs.map(arg => `"${arg}"`).join(" ")}\n`;
   }
@@ -198,10 +246,10 @@ async function generateLLDBScript(
 }
 
 async function runLLDB(target: string, script: string, maxSeconds: number): Promise<LLDBResult> {
-  const tempScriptPath = path.join(process.cwd(), `lldb_script_${Date.now()}.txt`);
+  const tempScriptPath = path.join(os.tmpdir(), `lldb_script_${Date.now()}.txt`);
 
   try {
-    fs.writeFileSync(tempScriptPath, script);
+    await fs.promises.writeFile(tempScriptPath, script);
 
     const timeoutMs = maxSeconds * 1000;
     const cmd = `lldb --batch -s "${tempScriptPath}" "${target}"`;
@@ -213,7 +261,7 @@ async function runLLDB(target: string, script: string, maxSeconds: number): Prom
     return { exitCode: -1, stdout: "", stderr: String(err) };
   } finally {
     try {
-      fs.unlinkSync(tempScriptPath);
+      await fs.promises.unlink(tempScriptPath);
     } catch {
       // Ignore cleanup errors
     }
@@ -237,7 +285,12 @@ function parseLLDBOutput(output: string): {
     exitReason: undefined as string | undefined
   };
 
-  const crashPatterns = [/EXC_BAD_ACCESS|EXC_CRASH|SIGABRT|SIGSEGV|SIGILL/, /Program terminated with signal/, /Process \d+ stopped/, /Thread \d+ crashed/];
+  const crashPatterns = [
+    /EXC_BAD_ACCESS|EXC_CRASH|SIGABRT|SIGSEGV|SIGILL/,
+    /Program terminated with signal/,
+    /Process \d+ stopped/,
+    /Thread \d+ crashed/
+  ];
 
   for (const pattern of crashPatterns) {
     if (pattern.test(output)) {
@@ -246,7 +299,20 @@ function parseLLDBOutput(output: string): {
     }
   }
 
-  const threadBacktraceMatch = output.match(/thread #(\d+),.*queue:'([^']+)'/);
+  // Extract crash location
+  if (result.hasCrash) {
+    const crashLocationMatch = output.match(/frame #0:.*`([^`]+)`.*at ([^:]+):(\d+)/);
+    if (crashLocationMatch) {
+      result.crashLocation = `${crashLocationMatch[1]} at ${crashLocationMatch[2]}:${crashLocationMatch[3]}`;
+    } else {
+      const simpleLocationMatch = output.match(/at ([^:]+):(\d+)/);
+      if (simpleLocationMatch) {
+        result.crashLocation = `${simpleLocationMatch[1]}:${simpleLocationMatch[2]}`;
+      }
+    }
+  }
+
+  const threadBacktraceMatch = output.match(/thread #(\d+)[,\s]/);
   if (threadBacktraceMatch) {
     result.crashedThread = parseInt(threadBacktraceMatch[1], 10);
   }
@@ -254,13 +320,13 @@ function parseLLDBOutput(output: string): {
   const breakpointMatches = output.match(/Breakpoint \d+ hit/gi);
   result.breakpointsHit = breakpointMatches ? breakpointMatches.length : 0;
 
-  const breakpointNameRegex = /hit breakpoint \d+\.\d+ at ([^\n]+)/gi;
+  const breakpointNameRegex = /Breakpoint \d+: where = .*`([^`]+)`/gi;
   let match;
   while ((match = breakpointNameRegex.exec(output)) !== null) {
     result.breakpointsTriggered.push(match[1].trim());
   }
 
-  const exitReasonMatch = output.match(/Process \d+ (exited with|terminated with|detached from) ([^\n]+)/i);
+  const exitReasonMatch = output.match(/Process \d+ (exited with|terminated with|detached from) (.+?)[\n\r]/i);
   if (exitReasonMatch) {
     result.exitReason = exitReasonMatch[2].trim();
   }
@@ -278,25 +344,23 @@ export default (async function LLDBDebugPlugin() {
           programArgs: tool.schema.array(tool.schema.string()).optional().default([]),
           artifactRoots: tool.schema.array(tool.schema.string()).optional().default(["target/debug", "target/release", ".build", "build", "dist", "out", "bin"]),
           breakpointsByName: tool.schema.array(tool.schema.string()).optional().default([]),
+          fileLineBreakpoints: tool.schema.array(
+            tool.schema.object({
+              file: tool.schema.string(),
+              line: tool.schema.number()
+            })
+          ).optional().default([]),
+          expressionPrints: tool.schema.array(tool.schema.string()).optional().default([]),
           breakpointLogCommands: tool.schema.array(tool.schema.string()).optional().default(["thread backtrace all", "frame variable"]),
           maxSeconds: tool.schema.number().optional().default(20),
           attempt: tool.schema.number().optional().default(1),
           targetOverride: tool.schema.string().optional()
         },
         async execute(args) {
-          logError("debug_run.execute called with args:", JSON.stringify(args));
+          logError("debug_run.execute called", `attempt ${args.attempt}`);
 
           try {
-            const buildCommands = args.buildCommands || [];
-            const programArgs = args.programArgs || [];
-            const artifactRoots = args.artifactRoots || ["target/debug", "target/release", ".build", "build", "dist", "out", "bin"];
-            const breakpointsByName = args.breakpointsByName || [];
-            const breakpointLogCommands = args.breakpointLogCommands || ["thread backtrace all", "frame variable"];
-            const maxSeconds = args.maxSeconds || 20;
-            const attempt = args.attempt || 1;
-            const targetOverride = args.targetOverride;
-
-            const buildResult = await runBuildCommands(buildCommands);
+            const buildResult = await runBuildCommands(args.buildCommands);
 
             if (buildResult.exitCode !== 0) {
               return JSON.stringify({
@@ -312,13 +376,13 @@ export default (async function LLDBDebugPlugin() {
 
             let artifactResult: ArtifactResult;
 
-            if (targetOverride) {
+            if (args.targetOverride) {
               artifactResult = {
-                chosen: targetOverride,
-                candidates: [{ path: targetOverride, mtimeMs: Date.now(), reason: "User-specified target" }]
+                chosen: args.targetOverride,
+                candidates: [{ path: args.targetOverride, mtimeMs: Date.now(), reason: "User-specified target" }]
               };
             } else {
-              artifactResult = await findNewestExecutable(artifactRoots);
+              artifactResult = await findNewestExecutable(args.artifactRoots);
             }
 
             if (!artifactResult.chosen) {
@@ -333,8 +397,16 @@ export default (async function LLDBDebugPlugin() {
               });
             }
 
-            const lldbScript = await generateLLDBScript(breakpointsByName, breakpointLogCommands, programArgs);
-            const lldbResult = await runLLDB(artifactResult.chosen, lldbScript, maxSeconds);
+            const lldbScript = await generateLLDBScript(
+              args.breakpointsByName,
+              args.fileLineBreakpoints,
+              args.expressionPrints,
+              args.breakpointLogCommands,
+              args.programArgs
+            );
+            
+            logError("Running LLDB", artifactResult.chosen);
+            const lldbResult = await runLLDB(artifactResult.chosen, lldbScript, args.maxSeconds);
 
             const analysis = parseLLDBOutput(lldbResult.stdout + lldbResult.stderr);
 
@@ -366,6 +438,28 @@ export default (async function LLDBDebugPlugin() {
           }
         }
       })
+    },
+    hooks: {
+      "tool.execute.after": async (input, output) => {
+        // Hook to observe debug_run results and suggest reruns
+        if (input.tool === "debug_run") {
+          try {
+            const result = JSON.parse(output.output);
+            
+            // If no breakpoints hit and no crash, suggest rerun
+            if (result.breakpointsHit === 0 && !result.hasCrash && result.status === "ok") {
+              logError("Debug run inconclusive", "no breakpoints hit");
+            }
+            
+            // If crash with no location, suggest more instrumentation
+            if (result.hasCrash && !result.analysis?.crashLocation) {
+              logError("Crash detected", "no location extracted");
+            }
+          } catch {
+            // Invalid JSON, ignore
+          }
+        }
+      }
     }
   };
 }) satisfies Plugin;
